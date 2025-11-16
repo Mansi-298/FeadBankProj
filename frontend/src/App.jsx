@@ -59,38 +59,34 @@ export default function App() {
   const startTrainingRound = async () => {
     try {
       setLoading(true);
+      // Start a new training round on server (backend will call Python scripts)
       const res = await trainingAPI.start();
-      const roundId = res.data.data._id;
-      
-      // Simulate bank updates
-      const updatedBanks = banks.map(bank => ({
-        bankId: bank._id,
-        gradients: {
-          w1: Math.random() * 0.01,
-          w2: Math.random() * 0.01,
-          w3: Math.random() * 0.01,
-          bias: Math.random() * 0.01
-        },
-        dataSize: Math.floor(Math.random() * 100) + 50
-      }));
+      const trainingRound = res.data.data;
 
-      for (const update of updatedBanks) {
-        await trainingAPI.submitUpdate({
-          roundId,
-          ...update
-        });
-      }
+      // reflect pending state and switch to training tab
+      setTrainingStatus({ activeRound: trainingRound, latestCompletedRound: trainingStatus?.latestCompletedRound, globalModel: trainingStatus?.globalModel });
+      setActiveTab('training');
 
-      // Aggregate updates
-      const aggregateRes = await trainingAPI.aggregate(roundId);
-      setTrainingStatus(aggregateRes.data.data.trainingRound);
-      setGlobalModel(aggregateRes.data.data.globalModel);
-      
-      await fetchAllData();
-      setError('');
+      // Poll status/current every 2 seconds until the round completes or fails
+      const poll = setInterval(async () => {
+        try {
+          const statusRes = await trainingAPI.getStatus();
+          setTrainingStatus(statusRes.data.data);
+          // when there is no active round and there is a latestCompletedRound, stop polling
+          if (!statusRes.data.data.activeRound && statusRes.data.data.latestCompletedRound) {
+            clearInterval(poll);
+            // refresh banks and models
+            await fetchAllData();
+            setLoading(false);
+          }
+        } catch (err) {
+          clearInterval(poll);
+          setError('Failed while polling training status: ' + err.message);
+          setLoading(false);
+        }
+      }, 2000);
     } catch (err) {
       setError('Failed to start training: ' + err.message);
-    } finally {
       setLoading(false);
     }
   };
@@ -119,6 +115,13 @@ export default function App() {
     round: round.roundNumber,
     accuracy: ((round.globalModel?.averageAccuracy || 0) * 100)
   }));
+
+  // Training progress helper values
+  const activeRound = trainingStatus?.activeRound;
+  const displayedRound = activeRound || trainingStatus?.latestCompletedRound;
+  const updatesReceived = displayedRound?.bankUpdates?.length || 0;
+  const totalBanks = banks.length || 0;
+  const trainingProgressPercent = totalBanks > 0 ? Math.round((updatesReceived / totalBanks) * 100) : 0;
 
   const modelMetricsData = selectedBank?.metrics ? [
     { name: 'Precision', value: parseFloat(selectedBank.metrics.precision) },
@@ -313,6 +316,17 @@ export default function App() {
         {/* TRAINING TAB */}
         {activeTab === 'training' && (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Training Progress Indicator */}
+            <div className="bg-slate-800 rounded-lg p-6 border border-slate-700 lg:col-span-2">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-xl font-bold text-white">Training Progress</h3>
+                <div className="text-sm text-slate-400">Updates: {updatesReceived} / {totalBanks} ({trainingProgressPercent}%)</div>
+              </div>
+              <div className="w-full bg-slate-700 rounded h-3 overflow-hidden">
+                <div className="bg-blue-500 h-3 rounded" style={{ width: `${trainingProgressPercent}%` }} />
+              </div>
+            </div>
+
             {/* Training Progress Chart */}
             <div className="bg-slate-800 rounded-lg p-6 border border-slate-700 lg:col-span-2">
               <h3 className="text-xl font-bold text-white mb-4">Training Progress Over Rounds</h3>

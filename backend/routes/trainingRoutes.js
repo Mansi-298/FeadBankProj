@@ -4,7 +4,10 @@ const router = express.Router();
 const Bank = require('../models/Bank');
 const TrainingRound = require('../models/TrainingRound');
 const GlobalModel = require('../models/GlobalModel');
-const { FraudDetectionModel, federatedAveraging } = require('../utils/mlUtils');
+const { FraudDetectionModel } = require('../utils/mlUtils');
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 // Start new training round
 router.post('/start', async (req, res) => {
@@ -22,13 +25,152 @@ router.post('/start', async (req, res) => {
     const latestRound = await TrainingRound.findOne().sort('-roundNumber');
     const roundNumber = latestRound ? latestRound.roundNumber + 1 : 1;
     
-    // Create new training round
+    // Create new training round (pending)
     const trainingRound = await TrainingRound.create({
       roundNumber,
       status: 'pending',
-      startTime: new Date()
+      startTime: new Date(),
+      bankUpdates: []
     });
-    
+
+    // Immediately respond to client that the round has been created.
+    // The server will now perform local training by invoking Python per-bank
+    // synchronously so the client can poll status until completion.
+    (async () => {
+      try {
+        // For each bank, call Python train_local.py <bankId>
+        const py = process.env.PYTHON_PATH || 'python';
+        const mlDir = path.resolve(__dirname, '..', '..', 'ml_engine');
+        const trainScript = path.join(mlDir, 'train_local.py');
+        const updates = [];
+
+        for (const bank of banks) {
+          // mark status training as we start receiving updates
+          trainingRound.status = 'training';
+          await trainingRound.save();
+
+          const sp = spawnSync(py, [trainScript, bank._id.toString()], { env: process.env, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
+          if (sp.error) {
+            // log and continue
+            console.error('train_local spawn error', sp.error);
+            continue;
+          }
+
+          if (sp.status !== 0) {
+            console.error('train_local stderr', sp.stderr);
+            // continue to next bank
+            continue;
+          }
+
+          let out;
+          try {
+            out = JSON.parse(sp.stdout);
+          } catch (e) {
+            console.error('Failed to parse train_local output', e, sp.stdout);
+            continue;
+          }
+
+          // Save bank update into trainingRound
+          trainingRound.bankUpdates.push({
+            bankId: bank._id,
+            bankName: bank.name,
+            gradients: out.gradients,
+            dataSize: out.dataSize,
+            accuracy: out.accuracy,
+            timestamp: new Date()
+          });
+
+          await trainingRound.save();
+          updates.push(out);
+        }
+
+        // If no updates were collected, mark round failed and exit
+        if (updates.length === 0) {
+          trainingRound.status = 'failed';
+          trainingRound.endTime = new Date();
+          await trainingRound.save();
+          return;
+        }
+
+        // Write updates to temp file for aggregator
+        const tmpDir = path.join(mlDir, 'tmp');
+        try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (e) {}
+        const updatesFile = path.join(tmpDir, `updates_round_${trainingRound.roundNumber}.json`);
+        fs.writeFileSync(updatesFile, JSON.stringify(updates, null, 2), 'utf8');
+
+        // Call aggregator
+        trainingRound.status = 'aggregating';
+        await trainingRound.save();
+
+        const aggregateScript = path.join(mlDir, 'aggregate.py');
+        const spAgg = spawnSync(py, [aggregateScript, updatesFile], { env: process.env, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
+        if (spAgg.error) {
+          console.error('aggregate spawn error', spAgg.error);
+          trainingRound.status = 'failed';
+          trainingRound.endTime = new Date();
+          await trainingRound.save();
+          return;
+        }
+
+        let aggOut;
+        try {
+          aggOut = JSON.parse(spAgg.stdout);
+        } catch (e) {
+          console.error('Failed to parse aggregate output', e, spAgg.stdout);
+          trainingRound.status = 'failed';
+          trainingRound.endTime = new Date();
+          await trainingRound.save();
+          return;
+        }
+
+        const aggregatedGradient = aggOut.aggregated_gradient;
+
+        // Load current global model
+        let currentGlobalModel = await GlobalModel.findOne({ isActive: true });
+        const model = new FraudDetectionModel(
+          currentGlobalModel ? currentGlobalModel.weights : undefined
+        );
+
+        // Apply aggregated gradient to the global model (FraudDetectionModel.updateWeights expects gradients)
+        model.updateWeights(aggregatedGradient);
+        const newWeights = model.getWeights();
+
+        // Compute average accuracy
+        const avgAccuracy = trainingRound.bankUpdates.reduce((sum, u) => sum + (u.accuracy || 0), 0) / trainingRound.bankUpdates.length;
+        const totalDataPoints = trainingRound.bankUpdates.reduce((sum, u) => sum + (u.dataSize || 0), 0);
+
+        const newVersion = currentGlobalModel ? currentGlobalModel.version + 1 : 1;
+        const globalModel = await GlobalModel.create({
+          version: newVersion,
+          weights: newWeights,
+          performance: {
+            averageAccuracy: avgAccuracy,
+            participatingBanks: trainingRound.bankUpdates.length,
+            totalDataPoints
+          },
+          trainingRoundId: trainingRound._id,
+          isActive: true
+        });
+
+        // Update training round
+        trainingRound.globalModel = {
+          weights: newWeights,
+          averageAccuracy: avgAccuracy,
+          updatedAt: new Date()
+        };
+        trainingRound.status = 'completed';
+        trainingRound.endTime = new Date();
+        await trainingRound.save();
+      } catch (err) {
+        console.error('Error in backend training orchestration', err);
+        try {
+          trainingRound.status = 'failed';
+          trainingRound.endTime = new Date();
+          await trainingRound.save();
+        } catch (e) {}
+      }
+    })();
+
     res.status(201).json({
       success: true,
       data: trainingRound
