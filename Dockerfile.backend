@@ -1,0 +1,36 @@
+# Backend Dockerfile
+FROM node:18-alpine
+
+# Install Python and dependencies for ML engine
+RUN apk add --no-cache python3 py3-pip
+
+# Set working directory
+WORKDIR /app
+
+# Copy package files
+COPY backend/package*.json ./
+
+# Install Node dependencies
+RUN npm install
+
+# Copy backend source code
+COPY backend/ ./
+
+# Copy ML engine
+COPY ml_engine/ /app/ml_engine/
+
+# Install Python dependencies
+RUN pip3 install --break-system-packages --no-cache-dir -r /app/ml_engine/requirements.txt
+
+# Create tmp directory for ML engine
+RUN mkdir -p /app/ml_engine/tmp
+
+# Set environment variables
+ENV NODE_ENV=production
+ENV PYTHON_PATH=python3
+
+# Expose port
+EXPOSE 5000
+
+# Start the server
+CMD ["node", "server.js"]

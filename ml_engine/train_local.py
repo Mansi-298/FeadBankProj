@@ -3,7 +3,7 @@ import sys
 import json
 import numpy as np
 from fraud_model import FraudModel
-from utils import load_bank, save_bank_local_model
+from utils import load_bank, save_bank_local_model, get_global_model
 
 
 def prepare_xy(transactions):
@@ -25,7 +25,8 @@ def main(bank_id):
     transactions = bank['transactions']
     X, y = prepare_xy(transactions)
 
-    init_weights = bank.get('localModel', {}).get('weights', {}) or {}
+    # Load GLOBAL model weights instead of local
+    init_weights = get_global_model()
     model = FraudModel(init_weights)
 
     # training hyperparams can be env-controlled

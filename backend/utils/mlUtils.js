@@ -27,6 +27,7 @@ class FraudDetectionModel {
     return this.sigmoid(z);
   }
 
+   
   train(data, epochs = 5) {
     const gradients = { w1: 0, w2: 0, w3: 0, bias: 0 };
     

@@ -28,6 +28,21 @@ def load_bank(bank_id):
     }
 
 
+def get_global_model():
+    """Fetch the current active global model from database"""
+    client = get_mongo_client()
+    db = client.get_default_database()
+    global_models = db.get_collection('globalmodels')
+    
+    model = global_models.find_one({'isActive': True})
+    
+    if model and 'weights' in model:
+        return model['weights']
+    else:
+        # Return default weights if no global model exists
+        return {'w1': 0.0, 'w2': 0.0, 'w3': 0.0, 'bias': 0.0}
+
+
 def save_bank_local_model(bank_id, new_weights, accuracy):
     client = get_mongo_client()
     db = client.get_default_database()
